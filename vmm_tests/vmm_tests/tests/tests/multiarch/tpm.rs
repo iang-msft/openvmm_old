@@ -910,3 +910,156 @@ async fn tpm_servicing<T: PetriVmmBackend>(
     vm.wait_for_clean_teardown().await?;
     Ok(())
 }
+
+/// Verify that the TPM worker process is sandboxed with seccomp and has
+/// restricted capabilities. This test confirms:
+/// 1. The TPM child process exists and is distinct from the main process
+/// 2. Seccomp filter mode is active (Seccomp: 2)
+/// 3. No new privileges can be gained (NoNewPrivs: 1)
+/// 4. Effective capabilities are empty
+/// 5. The TPM still functions correctly despite the sandbox
+#[cfg(target_os = "linux")]
+#[openvmm_test(uefi_x64(vhd(alpine_3_23_x64)))]
+async fn tpm_worker_is_sandboxed(
+    config: PetriVmBuilder<OpenVmmPetriBackend>,
+) -> anyhow::Result<()> {
+    let (mut vm, agent) = config
+        .with_tpm(true)
+        .run()
+        .await?;
+
+    // Find the TPM worker child process. The TPM worker is a sibling of the
+    // VM worker process (both are children of the mesh/test process).
+    let vm_worker_pid = vm.backend().pid();
+    let tpm_pid = find_tpm_worker_pid(vm_worker_pid)
+        .context("failed to find TPM worker process")?;
+
+    let tpm_cmdline = std::fs::read_to_string(format!("/proc/{tpm_pid}/cmdline"))
+        .unwrap_or_default()
+        .replace('\0', " ");
+    tracing::info!("Found TPM worker: pid={tpm_pid}, cmdline={tpm_cmdline}");
+
+    // Read the TPM worker's /proc status to verify sandbox state.
+    let status = std::fs::read_to_string(format!("/proc/{tpm_pid}/status"))
+        .with_context(|| format!("failed to read /proc/{tpm_pid}/status"))?;
+
+    // Assert seccomp filter mode is active (mode 2 = filter).
+    let seccomp_line = status
+        .lines()
+        .find(|l| l.starts_with("Seccomp:"))
+        .context("no Seccomp line in /proc/status")?;
+    ensure!(
+        seccomp_line.contains('2'),
+        "TPM worker should have seccomp filter active, got: {seccomp_line}"
+    );
+
+    // Assert NoNewPrivs is set (prevents privilege escalation).
+    let no_new_privs_line = status
+        .lines()
+        .find(|l| l.starts_with("NoNewPrivs:"))
+        .context("no NoNewPrivs line in /proc/status")?;
+    ensure!(
+        no_new_privs_line.contains('1'),
+        "TPM worker should have NoNewPrivs set, got: {no_new_privs_line}"
+    );
+
+    // Assert effective capabilities are empty (all caps dropped).
+    let cap_eff_line = status
+        .lines()
+        .find(|l| l.starts_with("CapEff:"))
+        .context("no CapEff line in /proc/status")?;
+    let cap_eff_value = cap_eff_line
+        .split_whitespace()
+        .nth(1)
+        .context("malformed CapEff line")?;
+    ensure!(
+        cap_eff_value.chars().all(|c| c == '0'),
+        "TPM worker should have empty effective capabilities, got: {cap_eff_line}"
+    );
+
+    // Verify the TPM still functions by checking the device is accessible from
+    // the guest and can process commands.
+    let sh = agent.unix_shell();
+    cmd!(sh, "test -c /dev/tpmrm0").run().await.context(
+        "TPM device not accessible in guest — sandbox may have broken the worker",
+    )?;
+
+    // Perform a basic TPM2 operation to confirm the worker is actually
+    // processing commands through the sandbox. Reading PCR 0 is a simple
+    // read-only operation that exercises the full command path.
+    let pcr_output = cmd!(sh, "cat /sys/class/tpm/tpm0/pcr-sha256/0")
+        .read()
+        .await
+        .context("failed to read TPM PCR — worker may not be functional")?;
+    ensure!(
+        !pcr_output.is_empty(),
+        "TPM PCR read returned empty — worker not functional"
+    );
+
+    agent.power_off().await?;
+    vm.wait_for_clean_teardown().await?;
+    Ok(())
+}
+
+/// Find the TPM worker process by scanning /proc for sibling processes of the
+/// given VM worker PID that have "tpm" as their worker argument.
+/// The TPM worker is launched by the same mesh parent as the VM worker.
+#[cfg(target_os = "linux")]
+fn find_tpm_worker_pid(vm_worker_pid: i32) -> anyhow::Result<i32> {
+    // First, find the parent of the VM worker process.
+    let vm_stat = std::fs::read_to_string(format!("/proc/{vm_worker_pid}/stat"))
+        .context("failed to read VM worker /proc/stat")?;
+    let mesh_parent_pid = vm_stat
+        .rfind(')')
+        .and_then(|pos| vm_stat[pos + 2..].split_whitespace().nth(1))
+        .and_then(|s| s.parse::<i32>().ok())
+        .context("failed to parse VM worker PPID")?;
+
+    // Now find sibling processes (children of the same parent) with "tpm" in cmdline.
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(pid_str) = name.to_str() else {
+            continue;
+        };
+        let Ok(pid) = pid_str.parse::<i32>() else {
+            continue;
+        };
+
+        // Skip the VM worker itself.
+        if pid == vm_worker_pid {
+            continue;
+        }
+
+        // Check if this process's parent is the mesh parent.
+        let stat_path = format!("/proc/{pid}/stat");
+        let Ok(stat) = std::fs::read_to_string(&stat_path) else {
+            continue;
+        };
+
+        let ppid = stat
+            .rfind(')')
+            .and_then(|pos| stat[pos + 2..].split_whitespace().nth(1))
+            .and_then(|s| s.parse::<i32>().ok());
+
+        if ppid != Some(mesh_parent_pid) {
+            continue;
+        }
+
+        // Check cmdline for the "tpm" worker argument.
+        let cmdline_path = format!("/proc/{pid}/cmdline");
+        let Ok(cmdline) = std::fs::read_to_string(&cmdline_path) else {
+            continue;
+        };
+
+        // cmdline is null-separated; the worker name is typically the last arg.
+        let args: Vec<&str> = cmdline.split('\0').filter(|s| !s.is_empty()).collect();
+        if args.last() == Some(&"tpm") {
+            return Ok(pid);
+        }
+    }
+
+    anyhow::bail!(
+        "no TPM worker sibling process found for VM worker PID {vm_worker_pid} (mesh parent PID {mesh_parent_pid})"
+    );
+}
